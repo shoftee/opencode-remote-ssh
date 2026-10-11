@@ -66,12 +66,20 @@ export class SSHManager {
       }
     }
 
-    await this.execSSHAllowFailure(sshArgs, "pkill -f 'opencode-remote-stub' 2>/dev/null || true");
+    // Bracket trick: the pattern matches the stub process but not the remote
+    // shell running this very command, which previously self-terminated.
+    await this.execSSHAllowFailure(sshArgs, "pkill -f '[o]pencode-remote-stub' 2>/dev/null || true");
     await this.execSSH(sshArgs, `mkdir -p ${installRoot}/log`);
     await this.execSSH(sshArgs, this.buildRemoteStartCommand(installRoot, remotePort));
 
     const { localPort, tunnelPID } = await this.ensureTunnel(workspaceID, target.host.name, sshConfig, identityFile, remotePort);
-    await this.waitForHealth(localPort, token);
+    try {
+      await this.waitForHealth(localPort, token);
+    } catch (error) {
+      // A failed health check must not leak the freshly spawned tunnel.
+      await this.closeTunnel(localPort, tunnelPID);
+      throw error;
+    }
 
     return {
       remotePort,
@@ -527,8 +535,17 @@ export class SSHManager {
   }
 
   private buildRemoteStartCommand(installRoot: string, remotePort: number): string {
+    // Single heredoc with explicit launcher detection. The previous form used
+    // two heredocs with the same label on one line, so bash bound the body to
+    // the first (possibly missing) interpreter and the fallback received an
+    // empty script, silently skipping the stub launch.
     return [
-      "python2 - <<'PY' 2>/dev/null || python - <<'PY'",
+      "launcher=''",
+      "for p in python python3 python2; do",
+      "  if command -v \"$p\" >/dev/null 2>&1; then launcher=\"$p\"; break; fi",
+      "done",
+      "[ -n \"$launcher\" ] || { echo 'no python launcher available' >&2; exit 1; }",
+      "\"$launcher\" - <<'PY'",
       "import os",
       "import subprocess",
       "import time",
