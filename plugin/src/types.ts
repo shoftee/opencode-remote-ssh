@@ -85,3 +85,14 @@ export interface WorkspaceTarget {
   url: string;
   headers: Record<string, string>;
 }
+
+// OpenCode 2.x has no workspace-adapter registration API, so this shape is kept
+// locally for the adapter below; the tools drive the same operations instead.
+export interface WorkspaceAdapter {
+  name: string;
+  description: string;
+  configure(workspace: WorkspaceInfo): WorkspaceInfo;
+  create(workspace: WorkspaceInfo): Promise<void>;
+  remove(workspace: WorkspaceInfo): Promise<void>;
+  target(workspace: WorkspaceInfo): Promise<WorkspaceTarget>;
+}
