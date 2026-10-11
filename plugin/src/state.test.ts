@@ -24,7 +24,11 @@ function binding(overrides: Partial<WorkspaceBinding> = {}): WorkspaceBinding {
 function withTempHome<T>(fn: () => T): T {
   const home = mkdtempSync(join(tmpdir(), "opencode-remote-state-test-"));
   const prevHome = process.env.HOME;
+  const prevStateFile = process.env.OPENCODE_REMOTE_STATE_FILE;
   process.env.HOME = home;
+  // RuntimeState resolves its path per construction, so redirect it at the
+  // temp home instead of the live plugin state file.
+  process.env.OPENCODE_REMOTE_STATE_FILE = join(home, ".config", "opencode", "opencode-remote-state.json");
   try {
     return fn();
   } finally {
@@ -32,6 +36,11 @@ function withTempHome<T>(fn: () => T): T {
       delete process.env.HOME;
     } else {
       process.env.HOME = prevHome;
+    }
+    if (prevStateFile === undefined) {
+      delete process.env.OPENCODE_REMOTE_STATE_FILE;
+    } else {
+      process.env.OPENCODE_REMOTE_STATE_FILE = prevStateFile;
     }
     rmSync(home, { recursive: true, force: true });
   }
@@ -82,10 +91,14 @@ function testRuntimeStateReplaceUpdatesPersistedBinding() {
 }
 
 function testRuntimeStateIgnoresMalformedPersistedState() {
-  // RuntimeState captures its state-file path at module evaluation time from the
-  // real process HOME, so exercising malformed persisted state would require a
-  // more invasive test harness. Keep this suite focused on persisted round-trip
-  // behavior under the actual module environment.
+  withTempHome(() => {
+    const stateFile = process.env.OPENCODE_REMOTE_STATE_FILE!;
+    mkdirSync(join(stateFile, ".."), { recursive: true });
+    writeFileSync(stateFile, "{not json", "utf8");
+
+    const state = new RuntimeState();
+    assert(state.list().length === 0, "expected malformed state file to load as empty");
+  });
 }
 
 function testProviderRegistryResolvesBySshHost() {
@@ -151,6 +164,51 @@ function testProviderRegistryAllowsSameWorkspaceToReuseExplicitLease() {
   assert(reusedByAlias.host.name === "prod-web-1", `expected same workspace to reuse explicit lease by alias, got ${reusedByAlias.host.name}`);
 }
 
+function testProviderRegistryReclaimsStaleLeaseButHonorsLiveOnes() {
+  const leases = new LeaseManager();
+  const liveWorkspaces = new Set<string>(["ws-live"]);
+  const registry = new ProviderRegistry(
+    resolveConfig({
+      providers: {
+        default: {
+          hosts: [
+            {
+              name: "prod-web-1",
+              ssh: {
+                host: "203.0.113.10",
+                user: "ops",
+              },
+            },
+          ],
+        },
+      },
+    }),
+    leases,
+    (workspaceID) => liveWorkspaces.has(workspaceID),
+  );
+
+  // A lease backed by a live workspace must still block other workspaces.
+  leases.acquire("prod-web-1", "ws-live", "exclusive");
+  let blocked = false;
+  try {
+    registry.acquireResolved({ provider: "default", host: "prod-web-1" }, "ws-new");
+  } catch {
+    blocked = true;
+  }
+  assert(blocked, "expected live lease held by another workspace to block acquisition");
+
+  // A lease with no live binding behind it (e.g. interrupted tool call) is
+  // reclaimed so the host becomes usable again without a restart.
+  leases.release("prod-web-1", "ws-live");
+  leases.acquire("prod-web-1", "ws-interrupted", "exclusive");
+  const reclaimed = registry.acquireResolved({ provider: "default", host: "prod-web-1" }, "ws-new");
+  assert(reclaimed.host.name === "prod-web-1", `expected stale lease to be reclaimed, got ${reclaimed.host.name}`);
+  assert(
+    leases.get("prod-web-1")?.workspaceID === "ws-new",
+    `expected reclaimed lease to belong to ws-new, got ${leases.get("prod-web-1")?.workspaceID}`,
+  );
+}
+
 function run() {
   testRuntimeStatePersistsBindings();
   testRuntimeStateDeletePersistsRemoval();
@@ -158,6 +216,7 @@ function run() {
   testRuntimeStateIgnoresMalformedPersistedState();
   testProviderRegistryResolvesBySshHost();
   testProviderRegistryAllowsSameWorkspaceToReuseExplicitLease();
+  testProviderRegistryReclaimsStaleLeaseButHonorsLiveOnes();
   console.log("state.test.ts: ok");
 }
 

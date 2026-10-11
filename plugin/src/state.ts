@@ -3,18 +3,26 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { WorkspaceBinding } from "./types.js";
 
-const STATE_FILE = (() => {
+function resolveStateFile(): string {
+  // Tests (and unusual deployments) point this at an isolated path; resolving
+  // per construction lets suites redirect it after module import.
+  const override = process.env.OPENCODE_REMOTE_STATE_FILE;
+  if (override) {
+    return override;
+  }
   const home = homedir();
   if (home) {
     return join(home, ".config", "opencode", "opencode-remote-state.json");
   }
   return join(tmpdir(), "opencode-remote-state.json");
-})();
+}
 
 export class RuntimeState {
   private readonly bindings = new Map<string, WorkspaceBinding>();
+  private readonly stateFile: string;
 
   constructor() {
+    this.stateFile = resolveStateFile();
     this.load();
   }
 
@@ -42,12 +50,12 @@ export class RuntimeState {
   }
 
   private load(): void {
-    if (!existsSync(STATE_FILE)) {
+    if (!existsSync(this.stateFile)) {
       return;
     }
 
     try {
-      const raw = readFileSync(STATE_FILE, "utf8");
+      const raw = readFileSync(this.stateFile, "utf8");
       const parsed = JSON.parse(raw);
       if (!Array.isArray(parsed)) {
         return;
@@ -68,9 +76,9 @@ export class RuntimeState {
   }
 
   private save(): void {
-    const dir = dirname(STATE_FILE);
+    const dir = dirname(this.stateFile);
     mkdirSync(dir, { recursive: true });
-    writeFileSync(STATE_FILE, JSON.stringify(Array.from(this.bindings.values()), null, 2), { mode: 0o600 });
-    chmodSync(STATE_FILE, 0o600);
+    writeFileSync(this.stateFile, JSON.stringify(Array.from(this.bindings.values()), null, 2), { mode: 0o600 });
+    chmodSync(this.stateFile, 0o600);
   }
 }
