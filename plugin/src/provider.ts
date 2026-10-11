@@ -12,6 +12,10 @@ export class ProviderRegistry {
   constructor(
     private readonly config: ResolvedPluginConfig,
     private readonly leases: LeaseManager,
+    // Reports whether a lease's workspace still has a live binding or an
+    // in-flight operation. Leases that fail this check are stale leftovers
+    // (e.g. from an interrupted tool call) and get reclaimed before failing.
+    private readonly isLeaseLive: (workspaceID: string) => boolean = () => true,
   ) {}
 
   resolve(request: HostSelectionRequest): ResolvedHost {
@@ -48,7 +52,13 @@ export class ProviderRegistry {
     }
 
     if (!workspaceID) {
-      const host = candidates.find((candidate) => !this.leases.get(candidate.name));
+      let host = candidates.find((candidate) => !this.leases.get(candidate.name));
+      if (!host) {
+        for (const candidate of candidates) {
+          this.reclaimStaleLease(candidate.name);
+        }
+        host = candidates.find((candidate) => !this.leases.get(candidate.name));
+      }
       if (!host) {
         throw new Error(`No available host found in provider '${request.provider}'`);
       }
@@ -73,8 +83,20 @@ export class ProviderRegistry {
           lease,
         };
       } catch {
-        // Try the next candidate. For explicit-host selection this loop has one item,
-        // so we naturally fall through to the final not-available error.
+        // The lease may be a stale leftover from an interrupted operation.
+        // Reclaim it when no live binding or in-flight work backs it, then
+        // retry the acquire once before moving on to the next candidate.
+        if (this.reclaimStaleLease(host.name)) {
+          try {
+            const lease = this.leases.acquire(host.name, workspaceID, this.config.defaults.leaseMode);
+            return {
+              selection: this.toResolved(request.provider, requestedLabels, host, strategy),
+              lease,
+            };
+          } catch {
+            // Still contended; try the next candidate.
+          }
+        }
       }
     }
 
@@ -95,6 +117,15 @@ export class ProviderRegistry {
 
   getLease(host: string) {
     return this.leases.get(host);
+  }
+
+  private reclaimStaleLease(hostName: string): boolean {
+    const lease = this.leases.get(hostName);
+    if (!lease || this.isLeaseLive(lease.workspaceID)) {
+      return false;
+    }
+    this.leases.release(hostName, lease.workspaceID);
+    return true;
   }
 
   private matchesLabels(host: HostConfig, labels: Set<string>): boolean {

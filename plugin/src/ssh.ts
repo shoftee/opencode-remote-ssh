@@ -152,6 +152,7 @@ export class SSHManager {
   private async execSSH(sshArgs: string[], command: string): Promise<string> {
     const { stdout } = await execFileAsync("ssh", [...sshArgs, command], {
       timeout: this.config.tunnel.connectTimeoutMs * 2,
+      windowsHide: true,
     });
     return stdout.trim();
   }
@@ -193,6 +194,7 @@ export class SSHManager {
 
     await execFileAsync("scp", [...args, localPath, destination], {
       timeout: this.config.tunnel.connectTimeoutMs * 4,
+      windowsHide: true,
     });
   }
 
@@ -324,6 +326,7 @@ export class SSHManager {
     const child = spawn("ssh", args, {
       detached: true,
       stdio: "ignore",
+      windowsHide: true,
     });
 
     child.unref();

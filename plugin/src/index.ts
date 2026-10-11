@@ -8,9 +8,21 @@ import type { WorkspaceAdapter, WorkspaceBinding, WorkspaceInfo, WorkspaceTarget
 
 const leases = new LeaseManager();
 const state = new RuntimeState();
+// Workspace IDs currently between lease acquisition and binding persistence.
+// Their leases are live even though no binding exists yet, so stale-lease
+// reclamation must not steal them mid-bootstrap.
+const inFlightWorkspaces = new Set<string>();
 let config: ResolvedPluginConfig;
 let sshManager: SSHManager;
 let providers: ProviderRegistry;
+
+function isLeaseLive(workspaceID: string): boolean {
+  if (inFlightWorkspaces.has(workspaceID)) {
+    return true;
+  }
+  const binding = state.list().find((binding) => binding.workspaceID === workspaceID);
+  return binding !== undefined && binding.status !== "removed";
+}
 
 function providerRequestForWorkspace(workspace: WorkspaceInfo) {
   if (!workspace.extra || typeof (workspace.extra as Record<string, unknown>).provider !== "string") {
@@ -74,6 +86,7 @@ async function createRemoteWorkspace(binding: WorkspaceBinding): Promise<void> {
 
 async function createConnectedBinding(providerName: string, host: string | undefined, workspaceName: string) {
   const workspaceID = `remote-${Date.now()}-${workspaceName.replace(/\s+/g, "-")}`;
+  inFlightWorkspaces.add(workspaceID);
   const selection = providers.acquireResolved({ provider: providerName, host }, workspaceID);
 
   try {
@@ -97,6 +110,8 @@ async function createConnectedBinding(providerName: string, host: string | undef
   } catch (error) {
     providers.release(selection.host.name, workspaceID);
     throw error;
+  } finally {
+    inFlightWorkspaces.delete(workspaceID);
   }
 }
 
@@ -276,6 +291,7 @@ function configureWorkspace(workspace: WorkspaceInfo): WorkspaceInfo {
 }
 
 async function createWorkspace(workspace: WorkspaceInfo): Promise<void> {
+  inFlightWorkspaces.add(workspace.id);
   const selection = providers.acquireResolved(providerRequestForWorkspace(workspace), workspace.id);
 
   try {
@@ -295,6 +311,8 @@ async function createWorkspace(workspace: WorkspaceInfo): Promise<void> {
   } catch (error) {
     providers.release(selection.host.name, workspace.id);
     throw error;
+  } finally {
+    inFlightWorkspaces.delete(workspace.id);
   }
 }
 
@@ -374,7 +392,7 @@ export default Plugin.define({
   async setup(ctx) {
     config = resolveConfig((ctx.options as unknown as ResolvedPluginConfig | undefined) ?? { providers: {} });
     sshManager = new SSHManager(config);
-    providers = new ProviderRegistry(config, leases);
+    providers = new ProviderRegistry(config, leases, isLeaseLive);
     rehydrateLeasesFromState();
 
     await ctx.tool.transform((editor) => {
@@ -400,6 +418,7 @@ export default Plugin.define({
             }
 
             const workspaceID = `remote-${Date.now()}-${(args.workspaceName ?? "workspace").replace(/\s+/g, "-")}`;
+            inFlightWorkspaces.add(workspaceID);
             const selection = providers.acquireResolved({
               provider: providerName,
               host: args.host,
@@ -421,6 +440,8 @@ export default Plugin.define({
             } catch (error) {
               providers.release(selection.host.name, workspaceID);
               throw error;
+            } finally {
+              inFlightWorkspaces.delete(workspaceID);
             }
 
             return {
